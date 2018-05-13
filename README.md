@@ -4,8 +4,28 @@ The Go http.Transport interface implemented over the WHATWG Fetch API using the 
 ## Usage
 
 This package requires the Go WASM compilation target to be supported.
+Short example:
+
+```go
+c := http.Client{
+    Transport: &fetch.Transport{},
+}
+resp, err := c.Get("https://api.github.com")
+if err != nil {
+    fmt.Println(err)
+    return
+}
+defer resp.Body.Close()
+b, err := ioutil.ReadAll(resp.Body)
+if err != nil {
+    fmt.Println(err)
+    return
+}
+fmt.Println(string(b))
+```
+
 See [my wasm-experiments repo](github.com/johanbrandhorst/wasm-experiments)
-for and example of its use.
+for the full example of its use.
 
 ## Attribution
 
