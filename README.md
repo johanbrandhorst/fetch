@@ -24,7 +24,7 @@ if err != nil {
 fmt.Println(string(b))
 ```
 
-See [my wasm-experiments repo](github.com/johanbrandhorst/wasm-experiments)
+See [my wasm-experiments repo](https://github.com/johanbrandhorst/wasm-experiments)
 for the full example of its use.
 
 ## Attribution
