@@ -15,6 +15,124 @@ import (
 // Adapted for syscall/js from
 // https://github.com/gopherjs/gopherjs/blob/8dffc02ea1cb8398bb73f30424697c60fcf8d4c5/compiler/natives/src/net/http/fetch.go
 
+// Transport is a RoundTripper that is implemented using the WHATWG Fetch API.
+// It supports streaming response bodies.
+type Transport struct{}
+
+// RoundTrip performs a full round trip of a request.
+func (*Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	headers := js.Global.Get("Headers").New()
+	for key, values := range req.Header {
+		for _, value := range values {
+			headers.Call("append", key, value)
+		}
+	}
+
+	ac := js.Global.Get("AbortController").New()
+
+	opt := js.Global.Get("Object").New()
+	opt.Set("headers", headers)
+	opt.Set("method", req.Method)
+	opt.Set("credentials", "same-origin")
+	opt.Set("signal", ac.Get("signal"))
+
+	var (
+		respCh = make(chan *http.Response, 1)
+		errCh  = make(chan error, 1)
+	)
+	if req.Body != nil {
+		/* Streaming request bodies are not supported yet
+		body := js.Global.Get("ReadableStream")
+		if body != js.Undefined {
+			source := js.Global.Get("Object").New()
+			// TODO(johanbrandhorst): Use ReadableByteStreamController.
+			// Currently Unsupported: https://developer.mozilla.org/en-US/docs/Web/API/ReadableByteStreamController#Browser_Compatibility
+			start := js.NewCallback(func(args []js.Value) {
+				fmt.Println("start called")
+				controller := args[0]
+				w := &streamWriter{controller: controller}
+				_, err := io.Copy(w, req.Body)
+				if err != nil {
+					errCh <- err
+					return
+				}
+			})
+			defer start.Close()
+			source.Set("start", start)
+			body = js.Global.Get("ReadableStream").New(source)
+		}
+		*/
+		content, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			req.Body.Close() // RoundTrip must always close the body, including on errors.
+			return nil, err
+		}
+		req.Body.Close()
+		opt.Set("body", js.ValueOf(content))
+	}
+	respPromise := js.Global.Call("fetch", req.URL.String(), opt)
+	if respPromise == js.Undefined {
+		return nil, errors.New("your browser does not support the Fetch API, please upgrade")
+	}
+
+	success := js.NewCallback(func(args []js.Value) {
+		result := args[0]
+		header := http.Header{}
+		writeHeaders := js.NewCallback(func(args []js.Value) {
+			key, value := args[0].String(), args[1].String()
+			ck := http.CanonicalHeaderKey(key)
+			header[ck] = append(header[ck], value)
+		})
+		defer writeHeaders.Close()
+		result.Get("headers").Call("forEach", writeHeaders)
+
+		contentLength := int64(-1)
+		if cl, err := strconv.ParseInt(header.Get("Content-Length"), 10, 64); err == nil {
+			contentLength = cl
+		}
+
+		b := result.Get("body")
+		var body io.ReadCloser
+		if b != js.Undefined {
+			body = &streamReader{stream: b.Call("getReader")}
+		} else {
+			// Fall back to using the arrayBuffer
+			// https://developer.mozilla.org/en-US/docs/Web/API/Body/arrayBuffer
+			body = &arrayReader{arrayPromise: result.Call("arrayBuffer")}
+		}
+		select {
+		case respCh <- &http.Response{
+			Status:        result.Get("status").String() + " " + http.StatusText(result.Get("status").Int()),
+			StatusCode:    result.Get("status").Int(),
+			Header:        header,
+			ContentLength: contentLength,
+			Body:          body,
+			Request:       req,
+		}:
+		case <-req.Context().Done():
+		}
+	})
+	defer success.Close()
+	failure := js.NewCallback(func(args []js.Value) {
+		select {
+		case errCh <- fmt.Errorf("net/http: fetch() failed: %s", args[0].String()):
+		case <-req.Context().Done():
+		}
+	})
+	defer failure.Close()
+	respPromise.Call("then", success, failure)
+	select {
+	case <-req.Context().Done():
+		// Abort the Fetch request
+		ac.Call("abort")
+		return nil, errors.New("net/http: request canceled")
+	case resp := <-respCh:
+		return resp, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
 // streamReader implements an io.ReadCloser wrapper for ReadableStream of https://fetch.spec.whatwg.org/.
 type streamReader struct {
 	pending []byte
@@ -24,8 +142,8 @@ type streamReader struct {
 func (r *streamReader) Read(p []byte) (n int, err error) {
 	if len(r.pending) == 0 {
 		var (
-			bCh   = make(chan []byte)
-			errCh = make(chan error)
+			bCh   = make(chan []byte, 1)
+			errCh = make(chan error, 1)
 		)
 		success := js.NewCallback(func(args []js.Value) {
 			result := args[0]
@@ -33,9 +151,7 @@ func (r *streamReader) Read(p []byte) (n int, err error) {
 				errCh <- io.EOF
 				return
 			}
-			value := make([]byte, result.Get("value").Get("byteLength").Int())
-			js.ValueOf(value).Call("set", result.Get("value"))
-			bCh <- value
+			bCh <- copyBytes(result.Get("value"))
 		})
 		defer success.Close()
 		failure := js.NewCallback(func(args []js.Value) {
@@ -76,15 +192,13 @@ func (r *arrayReader) Read(p []byte) (n int, err error) {
 	if !r.read {
 		r.read = true
 		var (
-			bCh   = make(chan []byte)
-			errCh = make(chan error)
+			bCh   = make(chan []byte, 1)
+			errCh = make(chan error, 1)
 		)
 		success := js.NewCallback(func(args []js.Value) {
 			// Wrap the input ArrayBuffer with a Uint8Array
 			uint8arrayWrapper := js.Global.Get("Uint8Array").New(args[0])
-			value := make([]byte, uint8arrayWrapper.Get("byteLength").Int())
-			js.ValueOf(value).Call("set", uint8arrayWrapper)
-			bCh <- value
+			bCh <- copyBytes(uint8arrayWrapper)
 		})
 		defer success.Close()
 		failure := js.NewCallback(func(args []js.Value) {
@@ -113,100 +227,21 @@ func (r *arrayReader) Close() error {
 	return nil
 }
 
-// Transport is a RoundTripper that is implemented using the WHATWG Fetch API.
-// It supports streaming response bodies.
-type Transport struct{}
+/*
+// streamWriter exposes a ReadableStreamDefaultController as an io.Writer
+// https://developer.mozilla.org/en-US/docs/Web/API/ReadableStreamDefaultController
+type streamWriter struct {
+	controller js.Value
+}
 
-// RoundTrip performs a full round trip of a request.
-func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	headers := js.Global.Get("Headers").New()
-	for key, values := range req.Header {
-		for _, value := range values {
-			headers.Call("append", key, value)
-		}
-	}
+func (w *streamWriter) Write(p []byte) (int, error) {
+	w.controller.Call("enqueue", p)
+	return len(p), nil
+}
+*/
 
-	ac := js.Global.Get("AbortController").New()
-
-	opt := js.Global.Get("Object").New()
-	opt.Set("headers", headers)
-	opt.Set("method", req.Method)
-	opt.Set("credentials", "same-origin")
-	opt.Set("signal", ac.Get("signal"))
-
-	if req.Body != nil {
-		body, err := ioutil.ReadAll(req.Body)
-		if err != nil {
-			_ = req.Body.Close() // RoundTrip must always close the body, including on errors.
-			return nil, err
-		}
-		_ = req.Body.Close()
-		opt.Set("body", body)
-	}
-	respPromise := js.Global.Call("fetch", req.URL.String(), opt)
-	if respPromise == js.Undefined {
-		return nil, errors.New("your browser does not support the Fetch API, please upgrade")
-	}
-
-	var (
-		respCh = make(chan *http.Response)
-		errCh  = make(chan error)
-	)
-	success := js.NewCallback(func(args []js.Value) {
-		result := args[0]
-		header := http.Header{}
-		writeHeaders := js.NewCallback(func(args []js.Value) {
-			key, value := args[0].String(), args[1].String()
-			ck := http.CanonicalHeaderKey(key)
-			header[ck] = append(header[ck], value)
-		})
-		defer writeHeaders.Close()
-		result.Get("headers").Call("forEach", writeHeaders)
-
-		contentLength := int64(-1)
-		if cl, err := strconv.ParseInt(header.Get("Content-Length"), 10, 64); err == nil {
-			contentLength = cl
-		}
-
-		b := result.Get("body")
-		var body io.ReadCloser
-		if b != js.Undefined {
-			body = &streamReader{stream: b.Call("getReader")}
-		} else {
-			// Fall back to using the arrayBuffer
-			// https://developer.mozilla.org/en-US/docs/Web/API/Body/arrayBuffer
-			body = &arrayReader{arrayPromise: result.Call("arrayBuffer")}
-		}
-
-		select {
-		case respCh <- &http.Response{
-			Status:        result.Get("status").String() + " " + http.StatusText(result.Get("status").Int()),
-			StatusCode:    result.Get("status").Int(),
-			Header:        header,
-			ContentLength: contentLength,
-			Body:          body,
-			Request:       req,
-		}:
-		case <-req.Context().Done():
-		}
-	})
-	defer success.Close()
-	failure := js.NewCallback(func(args []js.Value) {
-		select {
-		case errCh <- fmt.Errorf("net/http: fetch() failed: %s", args[0].String()):
-		case <-req.Context().Done():
-		}
-	})
-	defer failure.Close()
-	respPromise.Call("then", success, failure)
-	select {
-	case <-req.Context().Done():
-		// Abort the Fetch request
-		ac.Call("abort")
-		return nil, errors.New("net/http: request canceled")
-	case resp := <-respCh:
-		return resp, nil
-	case err := <-errCh:
-		return nil, err
-	}
+func copyBytes(in js.Value) []byte {
+	value := make([]byte, in.Get("byteLength").Int())
+	js.ValueOf(value).Call("set", in)
+	return value
 }
